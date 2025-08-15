@@ -1,0 +1,123 @@
+from qgis.PyQt.QtCore import QVariant
+from qgis.core import (
+    QgsProject,
+    QgsSpatialIndex,
+    QgsField,
+    QgsWkbTypes
+)
+
+# --- Configuração do TIPO a processar ---
+target_tipo = 'LNE'
+
+layer_name = 'PEDRA 90 — lotes_cuiaba_completo__lotes_cuiaba'
+layers = QgsProject.instance().mapLayersByName(layer_name)
+if not layers:
+    raise RuntimeError(f"Camada '{layer_name}' não encontrada no projeto.")
+tlayer = layers[0]
+
+# 1. Filtrar feições do TIPO-alvo
+feats = [f for f in tlayer.getFeatures() if f['TIPO'] == target_tipo]
+if not feats:
+    raise RuntimeError(f"Nenhuma feição encontrada com TIPO = '{target_tipo}'")
+
+# 2. Índice espacial para esse subconjunto
+index = QgsSpatialIndex()
+for f in feats:
+    index.insertFeature(f)
+
+# 3. Grafo de adjacência com fronteira >= 1m, contenção, interseção poligonal e proximidade ≤ 0.2m
+adj = {f.id(): set() for f in feats}
+prox_limite = 0.2  # metros, distância máxima para considerar "quase contíguo"
+
+for feat in feats:
+    fid = feat.id()
+    geom = feat.geometry()
+    for nbr_id in index.intersects(geom.boundingBox()):
+        if nbr_id == fid:
+            continue
+        nbr_feat = tlayer.getFeature(nbr_id)
+        if nbr_feat['TIPO'] != target_tipo:
+            continue
+
+        nbr_geom = nbr_feat.geometry()
+        common = geom.intersection(nbr_geom)
+
+        # Fronteira >= 1 metro
+        if (not common.isEmpty() and
+            common.type() == QgsWkbTypes.LineGeometry and
+            common.length() >= 1.0):
+            adj[fid].add(nbr_id)
+            adj[nbr_id].add(fid)
+            continue
+
+        # Contenção
+        if geom.within(nbr_geom) or nbr_geom.within(geom):
+            adj[fid].add(nbr_id)
+            adj[nbr_id].add(fid)
+            continue
+
+        # Interseção poligonal (sobreposição) com área > 0
+        if (not common.isEmpty() and
+            common.type() == QgsWkbTypes.PolygonGeometry and
+            common.area() > 0):
+            adj[fid].add(nbr_id)
+            adj[nbr_id].add(fid)
+            continue
+
+        # Proximidade sem tocar (distância > 0 e <= limite)
+        dist = geom.distance(nbr_geom)
+        if dist > 0 and dist <= prox_limite:
+            adj[fid].add(nbr_id)
+            adj[nbr_id].add(fid)
+
+# 4. Componentes conexas (blocos)
+visited = set()
+blocks = []
+for fid in adj:
+    if fid in visited:
+        continue
+    stack, comp = [fid], set()
+    while stack:
+        cur = stack.pop()
+        if cur in comp:
+            continue
+        comp.add(cur)
+        visited.add(cur)
+        for nb in adj[cur]:
+            if nb not in comp:
+                stack.append(nb)
+    blocks.append(comp)
+
+# 5. Iniciar edição e preparar campos
+if not tlayer.isEditable():
+    tlayer.startEditing()
+prov = tlayer.dataProvider()
+if tlayer.fields().indexOf('SOMA_AREA') < 0:
+    prov.addAttributes([QgsField('SOMA_AREA', QVariant.Double)])
+    tlayer.updateFields()
+if tlayer.fields().indexOf('contiguos') < 0:
+    prov.addAttributes([QgsField('contiguos', QVariant.String)])
+    tlayer.updateFields()
+idx_soma = tlayer.fields().indexOf('SOMA_AREA')
+idx_cont = tlayer.fields().indexOf('contiguos')
+
+# 6. Aplicar soma e marcação para todos lotes do bloco
+for blk in blocks:
+    if len(blk) < 2:
+        continue
+    feats_blk = [tlayer.getFeature(f) for f in blk]
+
+    total = sum(float(f['AREA']) for f in feats_blk)
+
+    rep_id = feats_blk[0].id()
+
+    for f in feats_blk:
+        tlayer.changeAttributeValue(f.id(), idx_soma, total)
+        tlayer.changeAttributeValue(f.id(), idx_cont, 'V' if f.id() == rep_id else 'F')
+
+# 7. Salvar alterações
+if not tlayer.commitChanges():
+    tlayer.rollBack()
+    raise RuntimeError("Falha ao salvar alterações.")
+
+print(f"Concluído para TIPO='{target_tipo}': {len([b for b in blocks if len(b)>=2])} blocos processados.")
