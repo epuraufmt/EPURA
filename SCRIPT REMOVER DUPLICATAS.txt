@@ -1,0 +1,54 @@
+from qgis.core import (
+    QgsProject,
+    QgsExpression,
+    QgsFeatureRequest,
+    QgsVectorLayer,
+    QgsExpressionContextUtils
+)
+
+# Substitua aqui pelo nome exato da camada
+layer_name = "EXPANSAO 0 — lotes_cuiaba_completo__lotes_cuiaba"
+
+# Procurar a camada pelo nome
+layers = QgsProject.instance().mapLayersByName(layer_name)
+if not layers:
+    raise Exception(f"Camada '{layer_name}' não encontrada no projeto.")
+
+layer = layers[0]
+
+if not layer.fields().indexFromName("inscricao") >= 0:
+    raise Exception("Campo 'inscricao' não encontrado na camada")
+
+if not layer.fields().indexFromName("TIPO") >= 0:
+    raise Exception("Campo 'TIPO' não encontrado na camada")
+
+from collections import defaultdict
+
+inscricao_dict = defaultdict(list)
+
+for feat in layer.getFeatures():
+    inscricao = feat["inscricao"]
+    if inscricao:
+        inscricao_dict[inscricao].append(feat)
+
+layer.startEditing()
+
+features_to_delete = []
+
+for inscricao, feats in inscricao_dict.items():
+    if len(feats) > 1:
+        keep = None
+        for feat in feats:
+            if feat["TIPO"] is None or str(feat["TIPO"]).strip() == "":
+                keep = feat
+                break
+        if keep is None:
+            keep = feats[0]
+        for feat in feats:
+            if feat.id() != keep.id():
+                features_to_delete.append(feat.id())
+
+layer.deleteFeatures(features_to_delete)
+layer.commitChanges()
+
+print(f"Removidas {len(features_to_delete)} feições duplicadas com base no campo 'inscricao'.")
